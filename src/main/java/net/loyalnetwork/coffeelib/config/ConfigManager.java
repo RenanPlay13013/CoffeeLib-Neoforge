@@ -9,12 +9,15 @@ import net.loyalnetwork.coffeelib.config.validation.RangeValidator;
 import net.loyalnetwork.coffeelib.config.validation.ValidationException;
 import org.slf4j.Logger;
 
+import net.loyalnetwork.coffeelib.config.reload.WatchServiceManager;
+
 import java.io.File;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.lang.reflect.ParameterizedType;
 import java.lang.reflect.Type;
 import java.util.*;
+import java.util.concurrent.*;
 
 public final class ConfigManager {
 
@@ -24,6 +27,10 @@ public final class ConfigManager {
     private final Map<Class<?>, List<FieldData>> fieldsByClass;
     private final Map<Class<?>, List<Method>> reloadMethods;
     private final List<ConfigFileHandle> handles;
+    private WatchServiceManager watcher;
+    private ScheduledExecutorService debouncer;
+    private ScheduledFuture<?> debounceTask;
+    private boolean shutdownHookRegistered;
 
     private ConfigManager(Logger logger, File configDir, List<Class<?>> configClasses) {
         this.logger = logger;
@@ -47,6 +54,12 @@ public final class ConfigManager {
         for (Class<?> configClass : configClasses) {
             loadClass(configClass);
         }
+
+        startWatching();
+    }
+
+    public void close() {
+        stopWatching();
     }
 
     public void reload() {
@@ -71,6 +84,53 @@ public final class ConfigManager {
                 }
             }
         }
+    }
+
+    private void startWatching() {
+        stopWatching();
+        debouncer = Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = new Thread(r, "Config-Debounce");
+            t.setDaemon(true);
+            return t;
+        });
+        watcher = new WatchServiceManager();
+        try {
+            watcher.start(configDir.toPath(), () -> {
+                if (debounceTask != null) {
+                    debounceTask.cancel(false);
+                }
+                debounceTask = debouncer.schedule(ConfigManager.this::reload, 100, TimeUnit.MILLISECONDS);
+            });
+            registerShutdownHook();
+            logger.info("File watching started for {}", configDir);
+        } catch (Exception e) {
+            logger.warn("Could not start file watching for {}: {}", configDir, e.getMessage());
+            watcher = null;
+        }
+    }
+
+    private void stopWatching() {
+        if (debounceTask != null) {
+            debounceTask.cancel(false);
+            debounceTask = null;
+        }
+        if (debouncer != null) {
+            debouncer.shutdownNow();
+            debouncer = null;
+        }
+        if (watcher != null) {
+            watcher.close();
+            watcher = null;
+        }
+    }
+
+    private void registerShutdownHook() {
+        if (shutdownHookRegistered) return;
+        shutdownHookRegistered = true;
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            stopWatching();
+            logger.info("File watching stopped for {}", configDir);
+        }));
     }
 
     @SuppressWarnings({"unchecked", "rawtypes"})
